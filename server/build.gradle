@@ -1,10 +1,12 @@
 description = 'CloudFoundry Identity Server JAR'
 
 Project identityModel = parent.subprojects.find { it.name.equals('cloudfoundry-identity-model') }
+Project identityClientLib = parent.subprojects.find { it.name.equals('cloudfoundry-identity-client-lib') }
 
 dependencies {
 
   compile(identityModel)
+  compile(identityClientLib)
 
   provided group: 'javax.servlet', name: 'javax.servlet-api', version: parent.servletVersion
   compile group: 'javax.mail', name: 'mail', version: parent.javamailVersion

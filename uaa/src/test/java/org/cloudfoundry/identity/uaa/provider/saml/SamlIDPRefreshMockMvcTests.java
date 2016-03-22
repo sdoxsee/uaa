@@ -30,7 +30,11 @@ import org.cloudfoundry.identity.uaa.zone.SamlConfig;
 import org.hamcrest.Matchers;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestRule;
+import org.junit.runner.Description;
+import org.junit.runners.model.Statement;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.common.util.RandomValueStringGenerator;
@@ -43,6 +47,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeTrue;
 import static org.springframework.http.MediaType.TEXT_HTML;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -57,6 +62,24 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 public class SamlIDPRefreshMockMvcTests extends InjectedMockContextTest {
 
     private static final String DEFAULT_SIMPLE_SAML_METADATA = String.format(MockMvcUtils.IDP_META_DATA, "http://simplesamlphp.cfapps.io/saml2/idp/metadata.php");
+
+    public class IsThereAZoneAwareManager implements TestRule {
+        @Override
+        public Statement apply(Statement statement, Description description) {
+            try {
+                if (getWebApplicationContext()==null) {
+                    SamlIDPRefreshMockMvcTests.super.initContextIfWeNeedIt();
+                }
+                getWebApplicationContext().getBean(ZoneAwareMetadataManager.class);
+            }catch (Exception x) {
+                assumeTrue("No ZoneAwareManager - ignoring", false);
+            }
+            return statement;
+        }
+    }
+
+    @Rule
+    public IsThereAZoneAwareManager isThereAZoneAwareManager = new IsThereAZoneAwareManager();
 
     private UaaTestAccounts testAccounts;
 

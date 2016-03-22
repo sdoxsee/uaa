@@ -167,7 +167,7 @@ qy45ptdwJLqLJCeNoR0JUcDNIRhOCuOPND7pcMtX6hI/
                 <!--<bean factory-bean="metaDataProviders" factory-method="getSamlIdentityProviders"/>-->
             <!--</constructor-arg>-->
         <!--</bean>-->
-        <bean id="metadata" class="org.cloudfoundry.identity.uaa.provider.saml.ZoneAwareMetadataManager"
+        <bean id="metadata" class="org.cloudfoundry.identity.uaa.provider.saml.NonSnarlMetadataManager"
               depends-on="idpBootstrap, metaDataProviders, identityZoneHolderInitializer"
               destroy-method="destroy">
             <constructor-arg name="providerDao" ref="identityProviderProvisioning"/>

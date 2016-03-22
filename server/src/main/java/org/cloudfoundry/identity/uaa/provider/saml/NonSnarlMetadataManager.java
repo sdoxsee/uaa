@@ -30,18 +30,23 @@
  */
 package org.cloudfoundry.identity.uaa.provider.saml;
 
+import org.cloudfoundry.identity.uaa.constants.OriginKeys;
+import org.cloudfoundry.identity.uaa.provider.IdentityProvider;
+import org.cloudfoundry.identity.uaa.provider.IdentityProviderProvisioning;
+import org.cloudfoundry.identity.uaa.provider.SamlIdentityProviderDefinition;
+import org.cloudfoundry.identity.uaa.zone.IdentityZone;
+import org.cloudfoundry.identity.uaa.zone.IdentityZoneHolder;
+import org.cloudfoundry.identity.uaa.zone.IdentityZoneProvisioning;
 import org.opensaml.common.xml.SAMLConstants;
 import org.opensaml.saml2.metadata.EntitiesDescriptor;
 import org.opensaml.saml2.metadata.EntityDescriptor;
 import org.opensaml.saml2.metadata.IDPSSODescriptor;
 import org.opensaml.saml2.metadata.RoleDescriptor;
 import org.opensaml.saml2.metadata.SPSSODescriptor;
-import org.opensaml.saml2.metadata.provider.ChainingMetadataProvider;
 import org.opensaml.saml2.metadata.provider.MetadataFilter;
 import org.opensaml.saml2.metadata.provider.MetadataFilterChain;
 import org.opensaml.saml2.metadata.provider.MetadataProvider;
 import org.opensaml.saml2.metadata.provider.MetadataProviderException;
-import org.opensaml.saml2.metadata.provider.ObservableMetadataProvider;
 import org.opensaml.saml2.metadata.provider.SignatureValidationFilter;
 import org.opensaml.xml.Configuration;
 import org.opensaml.xml.XMLObject;
@@ -62,374 +67,192 @@ import org.springframework.security.saml.key.KeyManager;
 import org.springframework.security.saml.metadata.ExtendedMetadata;
 import org.springframework.security.saml.metadata.ExtendedMetadataDelegate;
 import org.springframework.security.saml.metadata.ExtendedMetadataProvider;
+import org.springframework.security.saml.metadata.MetadataManager;
+import org.springframework.security.saml.metadata.MetadataMemoryProvider;
 import org.springframework.security.saml.trust.AllowAllSignatureTrustEngine;
 import org.springframework.security.saml.trust.httpclient.TLSProtocolConfigurer;
 import org.springframework.security.saml.util.SAMLUtil;
-import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
 
+import javax.xml.namespace.QName;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 
-public class NonSnarlMetadataManager extends ChainingMetadataProvider implements ExtendedMetadataProvider, InitializingBean, DisposableBean {
+public class NonSnarlMetadataManager extends MetadataManager implements ExtendedMetadataProvider, InitializingBean, DisposableBean {
 
     // Class logger
     protected final Logger log = LoggerFactory.getLogger(NonSnarlMetadataManager.class);
-
-    // Lock for the instance
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-
-    // Lock for the refresh mechanism
-    private final ReentrantReadWriteLock refreshLock = new ReentrantReadWriteLock();
-
-    private String hostedSPName;
-
-    private String defaultIDP;
 
     private ExtendedMetadata defaultExtendedMetadata;
 
     // Timer used to refresh the metadata upon changes
     private Timer timer;
 
-    // Internal of metadata refresh checking in ms
-    private long refreshCheckInterval = 10000l;
-
-    // Flag indicating whether metadata needs to be reloaded
-    private boolean refreshRequired = true;
-
     // Storage for cryptographic data used to verify metadata signatures
     protected KeyManager keyManager;
 
-    // All providers which were added, not all may be active
-    private List<ExtendedMetadataDelegate> availableProviders;
+    private final IdentityProviderProvisioning providerDao;
+    private final IdentityZoneProvisioning zoneDao;
+    private final SamlIdentityProviderConfigurator configurator;
 
-    /**
-     * Set of IDP names available in the system.
-     */
-    private Set<String> idpName;
+    private Map<IdentityZone, ExtendedMetadataDelegate> localSps = new HashMap<>();
 
-    /**
-     * Set of SP names available in the system.
-     */
-    private Set<String> spName;
-
-    /**
-     * All valid aliases.
-     */
-    private Set<String> aliasSet;
-
-    /**
-     * Creates new metadata manager, automatically registers itself for notifications from metadata changes and calls
-     * reload upon a change. Also registers timer which verifies whether metadata needs to be reloaded in a specified
-     * time interval.
-     * <p>
-     * It is mandatory that method afterPropertiesSet is called after the construction.
-     *
-     * @param providers providers to include, mustn't be null or empty
-     * @throws MetadataProviderException error during initialization
-     */
-    public NonSnarlMetadataManager(List<MetadataProvider> providers) throws MetadataProviderException {
-
-        super();
-
-        this.idpName = new HashSet<String>();
-        this.spName = new HashSet<String>();
+    public NonSnarlMetadataManager(IdentityProviderProvisioning providerDao, IdentityZoneProvisioning zoneDao, SamlIdentityProviderConfigurator configurator) throws MetadataProviderException {
+        super(Collections.EMPTY_LIST);
+        this.providerDao = providerDao;
+        this.zoneDao = zoneDao;
+        this.configurator = configurator;
         this.defaultExtendedMetadata = new ExtendedMetadata();
-        availableProviders = new LinkedList<ExtendedMetadataDelegate>();
-
-        setProviders(providers);
-        getObservers().add(new MetadataProviderObserver());
-
     }
 
-    /**
-     * Method must be called after provider construction. It creates the refresh timer and refreshes the metadata for
-     * the first time.
-     *
-     * @throws MetadataProviderException error
-     */
-    public final void afterPropertiesSet() throws MetadataProviderException {
-
-        Assert.notNull(keyManager, "KeyManager must be set");
-
-        // Create timer if needed
-        if (refreshCheckInterval > 0) {
-            log.debug("Creating metadata reload timer with interval {}", refreshCheckInterval);
-            this.timer = new Timer("Metadata-reload", true);
-            this.timer.schedule(new RefreshTask(), refreshCheckInterval, refreshCheckInterval);
-        } else {
-            log.debug("Metadata reload timer is not created, refreshCheckInternal is {}", refreshCheckInterval);
-        }
-
-        refreshMetadata();
-
-    }
-
-    /**
-     * Stops and removes the timer in case it was started. Cleans all metadata objects.
-     */
+    @Override
     public void destroy() {
-
-        try {
-
-            refreshLock.writeLock().lock();
-            lock.writeLock().lock();
-
-            for (MetadataProvider provider : getProviders()) {
-                if (provider instanceof ExtendedMetadataDelegate) {
-                    ((ExtendedMetadataDelegate) provider).destroy();
-                }
-            }
-
-            super.destroy();
-
-            if (timer != null) {
-                timer.cancel();
-                timer.purge();
-                timer = null;
-            }
-
-            // Workaround for Tomcat detection of terminated threads
-            try {Thread.sleep( 1000 );} catch ( InterruptedException ie ) { }
-
-            setRefreshRequired(false);
-
-        } finally {
-
-            lock.writeLock().unlock();
-            refreshLock.writeLock().unlock();
-
-        }
 
     }
 
     @Override
     public void setProviders(List<MetadataProvider> newProviders) throws MetadataProviderException {
-
-        try {
-
-            lock.writeLock().lock();
-
-            availableProviders.clear();
-            if (newProviders != null) {
-                for (MetadataProvider provider : newProviders) {
-                    addMetadataProvider(provider);
-                }
-            }
-
-        } finally {
-
-            lock.writeLock().unlock();
-
-        }
-
-        setRefreshRequired(true);
-
     }
 
-    /**
-     * Method can be repeatedly called to browse all configured providers and load SP and IDP names which
-     * are supported by them. Providers which fail during initialization are ignored for this refresh.
-     */
+    @Override
     public void refreshMetadata() {
-
-        try {
-
-            // Prevent anyone from changing the refresh status during reload to avoid missed calls
-            refreshLock.writeLock().lock();
-
-            // Make sure refresh is really necessary
-            if (!isRefreshRequired()) {
-                log.debug("Refresh is not required, isRefreshRequired flag isn't set");
-                return;
-            }
-
-            log.debug("Reloading metadata");
-
-            try {
-
-                // Let's load new metadata lists
-                lock.writeLock().lock();
-
-                // Remove existing providers, they'll get repopulated
-                super.setProviders(Collections.<MetadataProvider>emptyList());
-
-                // Reinitialize the sets
-                idpName = new HashSet<String>();
-                spName = new HashSet<String>();
-                aliasSet = new HashSet<String>();
-
-                for (ExtendedMetadataDelegate provider : availableProviders) {
-
-                    try {
-
-                        log.debug("Refreshing metadata provider {}", provider.toString());
-                        initializeProviderFilters(provider);
-                        initializeProvider(provider);
-                        initializeProviderData(provider);
-
-                        // Make provider available for queries
-                        super.addMetadataProvider(provider);
-                        log.debug("Metadata provider was initialized {}", provider.toString());
-
-                    } catch (MetadataProviderException e) {
-
-                        log.error("Initialization of metadata provider " + provider + " failed, provider will be ignored", e);
-
-                    }
-
-                }
-
-                // Clear the refresh flag
-                setRefreshRequired(false);
-
-                log.debug("Reloading metadata was finished");
-
-            } catch (MetadataProviderException e) {
-
-                throw new RuntimeException("Error clearing existing providers");
-
-            } finally {
-
-                lock.writeLock().unlock();
-
-            }
-
-        } finally {
-
-            refreshLock.writeLock().unlock();
-
-        }
-
     }
 
-    /**
-     * Adds a new metadata provider to the managed list. At first provider is only registered and will be validated
-     * upon next round of metadata refreshing or call to refreshMetadata.
-     * <p>
-     * Unless provider already extends class ExtendedMetadataDelegate it will be automatically wrapped in it as part of the
-     * addition.
-     *
-     * @param newProvider provider
-     * @throws MetadataProviderException in case provider can't be added
-     */
     @Override
     public void addMetadataProvider(MetadataProvider newProvider) throws MetadataProviderException {
+        //no op
+        if (newProvider instanceof ExtendedMetadataDelegate) {
 
-        if (newProvider == null) {
-            throw new IllegalArgumentException("Null provider can't be added");
+            ExtendedMetadataDelegate provider = (ExtendedMetadataDelegate) newProvider;
+            if (provider.getDelegate() instanceof MetadataMemoryProvider) {
+                localSps.put(IdentityZoneHolder.get(), provider);
+            }
         }
-
-        try {
-
-            lock.writeLock().lock();
-
-            ExtendedMetadataDelegate wrappedProvider = getWrappedProvider(newProvider);
-            availableProviders.add(wrappedProvider);
-
-        } finally {
-            lock.writeLock().unlock();
-        }
-
-        setRefreshRequired(true);
-
     }
 
-    /**
-     * Removes existing metadata provider from the availability list. Provider will be completely removed
-     * during next manager refresh.
-     *
-     * @param provider provider to remove
-     */
     @Override
     public void removeMetadataProvider(MetadataProvider provider) {
-
-        if (provider == null) {
-            throw new IllegalArgumentException("Null provider can't be removed");
-        }
-
-        try {
-
-            lock.writeLock().lock();
-
-            ExtendedMetadataDelegate wrappedProvider = getWrappedProvider(provider);
-            availableProviders.remove(wrappedProvider);
-
-        } finally {
-            lock.writeLock().unlock();
-        }
-
-        setRefreshRequired(true);
-
+        //no op
     }
 
-    /**
-     * Method provides list of active providers - those which are valid and can be queried for metadata. Returned
-     * value is a copy.
-     *
-     * @return active providers
-     */
     public List<MetadataProvider> getProviders() {
-
-        try {
-            lock.readLock().lock();
-            return new ArrayList<MetadataProvider>(super.getProviders());
-        } finally {
-            lock.readLock().unlock();
+        List<MetadataProvider> result = new ArrayList<>();
+        for (ExtendedMetadataDelegate delegate : getAvailableProviders()) {
+            result.add(delegate);
         }
-
+        return result;
     }
 
-    /**
-     * Method provides list of all available providers. Not all of these providers may be used in case their validation failed.
-     * Returned value is a copy of the data.
-     *
-     * @return all available providers
-     */
     public List<ExtendedMetadataDelegate> getAvailableProviders() {
-
-        try {
-            lock.readLock().lock();
-            return new ArrayList<ExtendedMetadataDelegate>(availableProviders);
-        } finally {
-            lock.readLock().unlock();
+        IdentityZone zone = IdentityZoneHolder.get();
+        List<IdentityProvider> identityProviders = providerDao.retrieveAll(false, zone.getId());
+        List<ExtendedMetadataDelegate> result = new ArrayList<>(identityProviders.size());
+        MetadataProvider localSp = localSps.get(IdentityZoneHolder.get());
+        if (localSp!=null) {
+            result.add((ExtendedMetadataDelegate)localSp);
         }
-
+        for (IdentityProvider provider : identityProviders) {
+            if (provider.isActive() && OriginKeys.SAML.equals(provider.getType())) {
+                SamlIdentityProviderDefinition definition = (SamlIdentityProviderDefinition)provider.getConfig();
+                log.info("Adding SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]");
+                try {
+                    ExtendedMetadataDelegate delegate = configurator.getExtendedMetadataDelegate(definition);
+                    initializeProvider(delegate);
+                    initializeProviderData(delegate);
+                    initializeProviderFilters(delegate);
+                    result.add(delegate);
+                } catch (MetadataProviderException e) {
+                    log.error("Invalid SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]", e);
+                }
+            } else {
+                log.info("Not an active SAML provider zone[" + zone.getId() + "] origin[" + provider.getOriginKey() + "]");
+            }
+        }
+        return result;
     }
 
-    private ExtendedMetadataDelegate getWrappedProvider(MetadataProvider provider) {
-        if (!(provider instanceof ExtendedMetadataDelegate)) {
-            log.debug("Wrapping metadata provider {} with extendedMetadataDelegate", provider);
-            return new ExtendedMetadataDelegate(provider);
-        } else {
-            return (ExtendedMetadataDelegate) provider;
-        }
-    }
-
-    /**
-     * Method is expected to make sure that the provider is properly initialized. Also all loaded filters should get
-     * applied.
-     *
-     * @param provider provider to initialize
-     * @throws MetadataProviderException error
-     */
+    @Override
     protected void initializeProvider(ExtendedMetadataDelegate provider) throws MetadataProviderException {
-
         // Initialize provider and perform signature verification
         log.debug("Initializing extendedMetadataDelegate {}", provider);
         provider.initialize();
 
     }
 
+    protected String getProviderIdpAlias(ExtendedMetadataDelegate provider) throws MetadataProviderException {
+        List<String> stringSet = parseProvider(provider);
+        for (String key : stringSet) {
+            RoleDescriptor idpRoleDescriptor = provider.getRole(key, IDPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS);
+            if (idpRoleDescriptor != null) {
+                return key;
+            }
+        }
+        return null;
+    }
+
+    protected String getProviderSpAlias(ExtendedMetadataDelegate provider) throws MetadataProviderException {
+        List<String> stringSet = parseProvider(provider);
+        for (String key : stringSet) {
+            RoleDescriptor spRoleDescriptor = provider.getRole(key, SPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS);
+            if (spRoleDescriptor != null) {
+                return key;
+            }
+        }
+        return null;
+    }
+
+    protected String getHostedSpName(ExtendedMetadataDelegate provider) throws MetadataProviderException {
+        List<String> stringSet = parseProvider(provider);
+        for (String key : stringSet) {
+            RoleDescriptor spRoleDescriptor = provider.getRole(key, SPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS);
+            if (spRoleDescriptor != null) {
+                ExtendedMetadata extendedMetadata = getExtendedMetadata(key, provider);
+                if (extendedMetadata != null) {
+                    if (extendedMetadata.isLocal()) {
+                        return key;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    protected String getProviderAlias(ExtendedMetadataDelegate provider) throws MetadataProviderException {
+        List<String> stringSet = parseProvider(provider);
+        for (String key : stringSet) {
+            // Verify extended metadata
+            ExtendedMetadata extendedMetadata = getExtendedMetadata(key, provider);
+            if (extendedMetadata != null) {
+                if (extendedMetadata.isLocal()) {
+                    // Parse alias
+                    String alias = extendedMetadata.getAlias();
+                    if (alias != null) {
+                        // Verify alias is valid
+                        SAMLUtil.verifyAlias(alias, key);
+                        return alias;
+                    } else {
+                        log.debug("Local entity {} doesn't have an alias", key);
+
+                    }
+                } else {
+                    log.debug("Remote entity {} available", key);
+                }
+            } else {
+                log.debug("No extended metadata available for entity {}", key);
+            }
+        }
+        return null;
+    }
     /**
      * Method populates local storage of IDP and SP names and verifies any name conflicts which might arise.
      *
@@ -437,97 +260,9 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
      * @throws MetadataProviderException error
      */
     protected void initializeProviderData(ExtendedMetadataDelegate provider) throws MetadataProviderException {
-
-        log.debug("Initializing provider data {}", provider);
-
-        List<String> stringSet = parseProvider(provider);
-
-        for (String key : stringSet) {
-
-            RoleDescriptor idpRoleDescriptor = provider.getRole(key, IDPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS);
-
-            if (idpRoleDescriptor != null) {
-                if (idpName.contains(key)) {
-                    log.warn("Provider {} contains entity {} with IDP which was already contained in another metadata provider and will be ignored", provider, key);
-                } else {
-                    idpName.add(key);
-                }
-            }
-
-            RoleDescriptor spRoleDescriptor = provider.getRole(key, SPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS);
-            if (spRoleDescriptor != null) {
-                if (spName.contains(key)) {
-                    log.warn("Provider {} contains entity {} which was already included in another metadata provider and will be ignored", provider, key);
-                } else {
-                    spName.add(key);
-                }
-            }
-
-            // Verify extended metadata
-            ExtendedMetadata extendedMetadata = getExtendedMetadata(key, provider);
-
-            if (extendedMetadata != null) {
-
-                if (extendedMetadata.isLocal()) {
-
-                    // Parse alias
-                    String alias = extendedMetadata.getAlias();
-                    if (alias != null) {
-
-                        // Verify alias is valid
-                        SAMLUtil.verifyAlias(alias, key);
-
-                        // Verify alias is unique
-                        if (aliasSet.contains(alias)) {
-
-                            log.warn("Provider {} contains alias {} which is not unique and will be ignored", provider, alias);
-
-                        } else {
-
-                            aliasSet.add(alias);
-                            log.debug("Local entity {} available under alias {}", key, alias);
-
-                        }
-
-                    } else {
-
-                        log.debug("Local entity {} doesn't have an alias", key);
-
-                    }
-
-                    // Set default local SP
-                    if (spRoleDescriptor != null && getHostedSPName() == null) {
-                        setHostedSPName(key);
-                    }
-
-                } else {
-
-                    log.debug("Remote entity {} available", key);
-
-                }
-
-            } else {
-
-                log.debug("No extended metadata available for entity {}", key);
-
-            }
-
-        }
-
     }
 
-    /**
-     * Method is automatically called during each attempt to initialize the provider data. It expects to load
-     * all filters required for metadata verification. It must also be ensured that metadata provider is ready to be used
-     * after call to this method.
-     * <p>
-     * Each provider must extend AbstractMetadataProvider or be of ExtendedMetadataDelegate type.
-     * <p>
-     * By default a SignatureValidationFilter is added together with any existing filters.
-     *
-     * @param provider provider to check
-     * @throws MetadataProviderException in case initialization fails
-     */
+    @Override
     protected void initializeProviderFilters(ExtendedMetadataDelegate provider) throws MetadataProviderException {
         boolean requireSignature = provider.isMetadataRequireSignature();
         SignatureTrustEngine trustEngine = getTrustEngine(provider);
@@ -555,12 +290,7 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
         }
     }
 
-    /**
-     * Method is expected to create a trust engine used to verify signatures from this provider.
-     *
-     * @param provider provider to create engine for
-     * @return trust engine or null to skip trust verification
-     */
+    @Override
     protected SignatureTrustEngine getTrustEngine(MetadataProvider provider) {
 
         Set<String> trustedKeys = null;
@@ -603,14 +333,7 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
 
     }
 
-    /**
-     * Method is expected to construct information resolver with all trusted data available for the given provider.
-     *
-     * @param provider     provider
-     * @param trustedKeys  trusted keys for the providers
-     * @param trustedNames trusted names for the providers (always null)
-     * @return information resolver
-     */
+    @Override
     protected PKIXValidationInformationResolver getPKIXResolver(MetadataProvider provider, Set<String> trustedKeys, Set<String> trustedNames) {
 
         // Use all available keys
@@ -636,13 +359,7 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
 
     }
 
-    /**
-     * Parses the provider and returns set of entityIDs contained inside the provider.
-     *
-     * @param provider provider to parse
-     * @return set of entityIDs available in the provider
-     * @throws MetadataProviderException error
-     */
+    @Override
     protected List<String> parseProvider(MetadataProvider provider) throws MetadataProviderException {
 
         List<String> result = new LinkedList<String>();
@@ -658,16 +375,6 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
 
     }
 
-    /**
-     * Recursively parses descriptors object. Supports both nested entitiesDescriptor
-     * elements and leaf entityDescriptors. EntityID of all found descriptors are added
-     * to the result set. Signatures on all found entities are verified using the given policy
-     * and trust engine.
-     *
-     * @param result      result set of parsed entity IDs
-     * @param descriptors descriptors to parse
-     * @throws MetadataProviderException in case signature validation fails
-     */
     private void addDescriptors(List<String> result, EntitiesDescriptor descriptors) throws MetadataProviderException {
 
         log.debug("Found metadata EntitiesDescriptor with ID", descriptors.getID());
@@ -701,157 +408,92 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
 
     }
 
-    /**
-     * Returns set of names of all IDPs available in the metadata
-     *
-     * @return set of entityID names
-     */
+    @Override
     public Set<String> getIDPEntityNames() {
-        try {
-            lock.readLock().lock();
-            // The set is never modified so we don't need to clone here, only make sure we get the right instance.
-            return Collections.unmodifiableSet(idpName);
-        } finally {
-            lock.readLock().unlock();
+        Set<String> result = new HashSet<>();
+        for (ExtendedMetadataDelegate delegate : getAvailableProviders()) {
+            try {
+                String idp = getProviderIdpAlias(delegate);
+                if (StringUtils.hasText(idp)) {
+                    result.add(idp);
+                }
+            } catch (MetadataProviderException e) {
+                log.error("Unable to get IDP alias for:"+delegate, e);
+            }
         }
+        return result;
     }
 
-    /**
-     * Returns set of names of all SPs entity names
-     *
-     * @return set of SP entity names available in the metadata
-     */
+    @Override
     public Set<String> getSPEntityNames() {
-        try {
-            lock.readLock().lock();
-            // The set is never modified so we don't need to clone here, only make sure we get the right instance.
-            return Collections.unmodifiableSet(spName);
-        } finally {
-            lock.readLock().unlock();
+        Set<String> result = new HashSet<>();
+        for (ExtendedMetadataDelegate delegate : getAvailableProviders()) {
+            try {
+                String sp = getHostedSpName(delegate);
+                if (StringUtils.hasText(sp)) {
+                    result.add(sp);
+                }
+            } catch (MetadataProviderException e) {
+                log.error("Unable to get IDP alias for:"+delegate, e);
+            }
         }
+        return result;
     }
 
-    /**
-     * @param idpID name of IDP to check
-     * @return true if IDP entity ID is in the circle of trust with our entity
-     */
+    @Override
     public boolean isIDPValid(String idpID) {
-        try {
-            lock.readLock().lock();
-            return idpName.contains(idpID);
-        } finally {
-            lock.readLock().unlock();
-        }
+        return getIDPEntityNames().contains(idpID);
     }
 
-    /**
-     * @param spID entity ID of SP to check
-     * @return true if given SP entity ID is valid in circle of trust
-     */
+    @Override
     public boolean isSPValid(String spID) {
-        try {
-            lock.readLock().lock();
-            return spName.contains(spID);
-        } finally {
-            lock.readLock().unlock();
-        }
+        return getIDPEntityNames().contains(spID);
     }
 
-    /**
-     * The method returns name of SP running this application. This name is either set from spring
-     * context of automatically by invoking of the metadata filter.
-     *
-     * @return name of hosted SP metadata which can be returned by call to getEntityDescriptor.
-     */
+    @Override
     public String getHostedSPName() {
-        return hostedSPName;
+        for (ExtendedMetadataDelegate delegate : getAvailableProviders()) {
+            try {
+                String spName = getHostedSpName(delegate);
+                if (StringUtils.hasText(spName)) {
+                    return spName;
+                }
+            } catch (MetadataProviderException e) {
+                log.error("Unable to find hosted SP name:"+delegate, e);
+            }
+        }
+        return null;
     }
 
-    /**
-     * Sets nameID of SP hosted on this machine. This can either be called from springContext or
-     * automatically during invocation of metadata generation filter.
-     *
-     * @param hostedSPName name of metadata describing SP hosted on this machine
-     */
+    @Override
     public void setHostedSPName(String hostedSPName) {
-        this.hostedSPName = hostedSPName;
+
     }
 
-    /**
-     * Returns entity ID of the IDP to be used by default. In case the defaultIDP property has been set
-     * it is returned. Otherwise first available IDP in IDP list is used.
-     *
-     * @return entity ID of IDP to use
-     * @throws MetadataProviderException in case IDP can't be determined
-     */
+    @Override
     public String getDefaultIDP() throws MetadataProviderException {
-
-        try {
-
-            lock.readLock().lock();
-
-            if (defaultIDP != null) {
-                return defaultIDP;
-            } else {
-                Iterator<String> iterator = getIDPEntityNames().iterator();
-                if (iterator.hasNext()) {
-                    return iterator.next();
-                } else {
-                    throw new MetadataProviderException("No IDP was configured, please update included metadata with at least one IDP");
-                }
-            }
-
-        } finally {
-
-            lock.readLock().unlock();
-
+        Iterator<String> iterator = getIDPEntityNames().iterator();
+        if (iterator.hasNext()) {
+            return iterator.next();
+        } else {
+            throw new MetadataProviderException("No IDP was configured, please update included metadata with at least one IDP");
         }
-
     }
 
-    /**
-     * Sets name of IDP to be used as default.
-     *
-     * @param defaultIDP IDP to set as default
-     */
+    @Override
     public void setDefaultIDP(String defaultIDP) {
-        this.defaultIDP = defaultIDP;
+        //no op
     }
 
-    /**
-     * Tries to locate ExtendedMetadata by trying one provider after another. Only providers implementing
-     * ExtendedMetadataProvider are considered.
-     * <p>
-     * In case none of the providers can supply the extended version, the default is used.
-     * <p>
-     * A copy of the internal representation is always returned, modifying the returned object will not be reflected
-     * in the subsequent calls.
-     *
-     * @param entityID entity ID to load extended metadata for
-     * @return extended metadata or defaults
-     * @throws MetadataProviderException never thrown
-     */
+    @Override
     public ExtendedMetadata getExtendedMetadata(String entityID) throws MetadataProviderException {
-
-        try {
-
-            lock.readLock().lock();
-
-            for (MetadataProvider provider : getProviders()) {
-                ExtendedMetadata extendedMetadata = getExtendedMetadata(entityID, provider);
-                if (extendedMetadata != null) {
-                    return extendedMetadata;
-                }
+        for (MetadataProvider provider : getProviders()) {
+            ExtendedMetadata extendedMetadata = getExtendedMetadata(entityID, provider);
+            if (extendedMetadata != null) {
+                return extendedMetadata;
             }
-
-            return getDefaultExtendedMetadata().clone();
-
-        } finally {
-
-            lock.readLock().unlock();
-
         }
-
+        return getDefaultExtendedMetadata().clone();
     }
 
     private ExtendedMetadata getExtendedMetadata(String entityID, MetadataProvider provider) throws MetadataProviderException {
@@ -865,217 +507,168 @@ public class NonSnarlMetadataManager extends ChainingMetadataProvider implements
         return null;
     }
 
-    /**
-     * Locates entity descriptor whose entityId SHA-1 hash equals the one in the parameter.
-     *
-     * @param hash hash of the entity descriptor
-     * @return found descriptor or null
-     * @throws MetadataProviderException in case metadata required for processing can't be loaded
-     */
+    @Override
     public EntityDescriptor getEntityDescriptor(byte[] hash) throws MetadataProviderException {
-
-        try {
-
-            lock.readLock().lock();
-
-            for (String idp : idpName) {
-                if (SAMLUtil.compare(hash, idp)) {
-                    return getEntityDescriptor(idp);
-                }
+        for (String idp : getIDPEntityNames()) {
+            if (SAMLUtil.compare(hash, idp)) {
+                return getEntityDescriptor(idp);
             }
-
-            for (String sp : spName) {
-                if (SAMLUtil.compare(hash, sp)) {
-                    return getEntityDescriptor(sp);
-                }
-            }
-
-            return null;
-
-        } finally {
-
-            lock.readLock().unlock();
-
         }
 
+        for (String sp : getSPEntityNames()) {
+            if (SAMLUtil.compare(hash, sp)) {
+                return getEntityDescriptor(sp);
+            }
+        }
+
+        return null;
     }
 
-    /**
-     * Tries to load entityId for entity with the given alias. Fails in case two entities with the same alias
-     * are configured in the system.
-     *
-     * @param entityAlias alias to locate id for
-     * @return entity id for the given alias or null if none exists
-     * @throws MetadataProviderException in case two entity have the same non-null alias
-     */
+    @Override
     public String getEntityIdForAlias(String entityAlias) throws MetadataProviderException {
-
-        try {
-
-            lock.readLock().lock();
-
-            if (entityAlias == null) {
-                return null;
-            }
-
-            String entityId = null;
-
-            for (String idp : idpName) {
-                ExtendedMetadata extendedMetadata = getExtendedMetadata(idp);
-                if (extendedMetadata.isLocal() && entityAlias.equals(extendedMetadata.getAlias())) {
-                    if (entityId != null && !entityId.equals(idp)) {
-                        throw new MetadataProviderException("Alias " + entityAlias + " is used both for entity " + entityId + " and " + idp);
-                    } else {
-                        entityId = idp;
-                    }
-                }
-            }
-
-            for (String sp : spName) {
-                ExtendedMetadata extendedMetadata = getExtendedMetadata(sp);
-                if (extendedMetadata.isLocal() && entityAlias.equals(extendedMetadata.getAlias())) {
-                    if (entityId != null && !entityId.equals(sp)) {
-                        throw new MetadataProviderException("Alias " + entityAlias + " is used both for entity " + entityId + " and " + sp);
-                    } else {
-                        entityId = sp;
-                    }
-                }
-            }
-
-            return entityId;
-
-        } finally {
-
-            lock.readLock().unlock();
-
+        if (entityAlias == null) {
+            return null;
         }
 
+        String entityId = null;
+
+        for (String idp : getIDPEntityNames()) {
+            ExtendedMetadata extendedMetadata = getExtendedMetadata(idp);
+            if (extendedMetadata.isLocal() && entityAlias.equals(extendedMetadata.getAlias())) {
+                if (entityId != null && !entityId.equals(idp)) {
+                    throw new MetadataProviderException("Alias " + entityAlias + " is used both for entity " + entityId + " and " + idp);
+                } else {
+                    entityId = idp;
+                }
+            }
+        }
+
+        for (String sp : getSPEntityNames()) {
+            ExtendedMetadata extendedMetadata = getExtendedMetadata(sp);
+            if (extendedMetadata.isLocal() && entityAlias.equals(extendedMetadata.getAlias())) {
+                if (entityId != null && !entityId.equals(sp)) {
+                    throw new MetadataProviderException("Alias " + entityAlias + " is used both for entity " + entityId + " and " + sp);
+                } else {
+                    entityId = sp;
+                }
+            }
+        }
+
+        return entityId;
     }
 
-    /**
-     * @return default extended metadata to be used in case no entity specific version exists, never null
-     */
+    @Override
     public ExtendedMetadata getDefaultExtendedMetadata() {
-        try {
-            lock.readLock().lock();
-            return defaultExtendedMetadata;
-        } finally {
-            lock.readLock().unlock();
-        }
+        return defaultExtendedMetadata;
     }
 
-    /**
-     * Sets default extended metadata to be used in case no version specific is available.
-     *
-     * @param defaultExtendedMetadata metadata, RuntimeException when null
-     */
+    @Override
     public void setDefaultExtendedMetadata(ExtendedMetadata defaultExtendedMetadata) {
-        Assert.notNull(defaultExtendedMetadata, "ExtendedMetadata parameter mustn't be null");
-        lock.writeLock().lock();
         this.defaultExtendedMetadata = defaultExtendedMetadata;
-        lock.writeLock().unlock();
     }
 
-    /**
-     * Flag indicating whether configuration of the metadata should be reloaded.
-     *
-     * @return true if reload is required
-     */
+    @Override
     public boolean isRefreshRequired() {
-        try {
-            refreshLock.readLock().lock();
-            return refreshRequired;
-        } finally {
-            refreshLock.readLock().unlock();
-        }
+        return false;
     }
 
-    /**
-     * Indicates that the metadata should be reloaded as the provider configuration has changed.
-     * Uses a separate locking mechanism to allow setting metadata refresh flag without interrupting existing readers.
-     *
-     * @param refreshRequired true if refresh is required
-     */
+    @Override
     public void setRefreshRequired(boolean refreshRequired) {
-
-        try {
-            refreshLock.writeLock().lock();
-            this.refreshRequired = refreshRequired;
-        } finally {
-            refreshLock.writeLock().unlock();
-        }
-
+        //no op
     }
 
 
-    /**
-     * Interval in milliseconds used for re-verification of metadata and their reload. Upon trigger each provider
-     * is asked to return it's metadata, which might trigger their reloading. In case metadata is reloaded the manager
-     * is notified and automatically refreshes all internal data by calling refreshMetadata.
-     * <p>
-     * In case the value is smaller than zero the timer is not created. The default value is 10000l.
-     * <p>
-     * The value can only be modified before the call to the afterBeanPropertiesSet, the changes are not applied after that.
-     *
-     * @param refreshCheckInterval internal, timer not created if &lt;= 2000
-     */
+    @Override
     public void setRefreshCheckInterval(long refreshCheckInterval) {
-        this.refreshCheckInterval = refreshCheckInterval;
-    }
-
-    /**
-     * Task used to refresh the metadata when required.
-     */
-    private class RefreshTask extends TimerTask {
-
-        @Override
-        public void run() {
-
-            try {
-
-                log.trace("Executing metadata refresh task");
-
-                // Invoking getMetadata performs a refresh in case it's needed
-                // Potentially expensive operation, but other threads can still load existing cached data
-                for (MetadataProvider provider : getProviders()) {
-                    provider.getMetadata();
-                }
-
-                // Refresh the metadataManager if needed
-                if (isRefreshRequired()) {
-                    refreshMetadata();
-                }
-
-            } catch (Throwable e) {
-                log.warn("Metadata refreshing has failed", e);
-            }
-
-        }
-
-    }
-
-    /**
-     * Observer which clears the cache upon any notification from any provider.
-     */
-    private class MetadataProviderObserver implements ObservableMetadataProvider.Observer {
-
-        /**
-         * {@inheritDoc}
-         */
-        public void onEvent(MetadataProvider provider) {
-            setRefreshRequired(true);
-        }
-
+        //no op
     }
 
     @Autowired
     public void setKeyManager(KeyManager keyManager) {
         this.keyManager = keyManager;
+        super.setKeyManager(keyManager);
     }
 
     @Autowired(required = false)
     public void setTLSConfigurer(TLSProtocolConfigurer configurer) {
         // Only explicit dependency
     }
+
+    public EntitiesDescriptor getEntitiesDescriptor(String name) throws MetadataProviderException {
+        EntitiesDescriptor descriptor = null;
+        for (MetadataProvider provider : getProviders()) {
+            log.debug("Checking child metadata provider for entities descriptor with name: {}", name);
+            try {
+                descriptor = provider.getEntitiesDescriptor(name);
+                if (descriptor != null) {
+                    break;
+                }
+            } catch (MetadataProviderException e) {
+                log.warn("Error retrieving metadata from provider of type {}, proceeding to next provider",
+                         provider.getClass().getName(), e);
+                continue;
+            }
+        }
+        return descriptor;
+    }
+
+    /** {@inheritDoc} */
+    public EntityDescriptor getEntityDescriptor(String entityID) throws MetadataProviderException {
+        EntityDescriptor descriptor = null;
+        for (MetadataProvider provider : getProviders()) {
+            log.debug("Checking child metadata provider for entity descriptor with entity ID: {}", entityID);
+            try {
+                descriptor = provider.getEntityDescriptor(entityID);
+                if (descriptor != null) {
+                    break;
+                }
+            } catch (MetadataProviderException e) {
+                log.warn("Error retrieving metadata from provider of type {}, proceeding to next provider",
+                         provider.getClass().getName(), e);
+                continue;
+            }
+        }
+        return descriptor;
+    }
+
+    /** {@inheritDoc} */
+    public List<RoleDescriptor> getRole(String entityID, QName roleName) throws MetadataProviderException {
+        List<RoleDescriptor> roleDescriptors = null;
+        for (MetadataProvider provider : getProviders()) {
+            log.debug("Checking child metadata provider for entity descriptor with entity ID: {}", entityID);
+            try {
+                roleDescriptors = provider.getRole(entityID, roleName);
+                if (roleDescriptors != null && !roleDescriptors.isEmpty()) {
+                    break;
+                }
+            } catch (MetadataProviderException e) {
+                log.warn("Error retrieving metadata from provider of type {}, proceeding to next provider",
+                         provider.getClass().getName(), e);
+                continue;
+            }
+        }
+        return roleDescriptors;
+    }
+
+    /** {@inheritDoc} */
+    public RoleDescriptor getRole(String entityID, QName roleName, String supportedProtocol)
+        throws MetadataProviderException {
+        RoleDescriptor roleDescriptor = null;
+        for (MetadataProvider provider : getProviders()) {
+            log.debug("Checking child metadata provider for entity descriptor with entity ID: {}", entityID);
+            try {
+                roleDescriptor = provider.getRole(entityID, roleName, supportedProtocol);
+                if (roleDescriptor != null) {
+                    break;
+                }
+            } catch (MetadataProviderException e) {
+                log.warn("Error retrieving metadata from provider of type {}, proceeding to next provider",
+                         provider.getClass().getName(), e);
+                continue;
+            }
+        }
+        return roleDescriptor;
+    }
+
 
 }

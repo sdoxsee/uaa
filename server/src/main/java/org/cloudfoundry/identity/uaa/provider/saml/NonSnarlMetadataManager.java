@@ -37,7 +37,9 @@ import org.cloudfoundry.identity.uaa.provider.SamlIdentityProviderDefinition;
 import org.cloudfoundry.identity.uaa.zone.IdentityZone;
 import org.cloudfoundry.identity.uaa.zone.IdentityZoneHolder;
 import org.cloudfoundry.identity.uaa.zone.IdentityZoneProvisioning;
+import org.joda.time.DateTime;
 import org.opensaml.common.xml.SAMLConstants;
+import org.opensaml.saml2.common.Extensions;
 import org.opensaml.saml2.metadata.EntitiesDescriptor;
 import org.opensaml.saml2.metadata.EntityDescriptor;
 import org.opensaml.saml2.metadata.IDPSSODescriptor;
@@ -49,15 +51,23 @@ import org.opensaml.saml2.metadata.provider.MetadataProvider;
 import org.opensaml.saml2.metadata.provider.MetadataProviderException;
 import org.opensaml.saml2.metadata.provider.SignatureValidationFilter;
 import org.opensaml.xml.Configuration;
+import org.opensaml.xml.Namespace;
+import org.opensaml.xml.NamespaceManager;
 import org.opensaml.xml.XMLObject;
+import org.opensaml.xml.schema.XSBooleanValue;
 import org.opensaml.xml.security.x509.BasicPKIXValidationInformation;
 import org.opensaml.xml.security.x509.BasicX509CredentialNameEvaluator;
 import org.opensaml.xml.security.x509.CertPathPKIXValidationOptions;
 import org.opensaml.xml.security.x509.PKIXValidationInformation;
 import org.opensaml.xml.security.x509.PKIXValidationInformationResolver;
 import org.opensaml.xml.security.x509.StaticPKIXValidationInformationResolver;
+import org.opensaml.xml.signature.Signature;
 import org.opensaml.xml.signature.SignatureTrustEngine;
 import org.opensaml.xml.signature.impl.PKIXSignatureTrustEngine;
+import org.opensaml.xml.util.IDIndex;
+import org.opensaml.xml.util.LazySet;
+import org.opensaml.xml.validation.ValidationException;
+import org.opensaml.xml.validation.Validator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
@@ -73,6 +83,7 @@ import org.springframework.security.saml.trust.AllowAllSignatureTrustEngine;
 import org.springframework.security.saml.trust.httpclient.TLSProtocolConfigurer;
 import org.springframework.security.saml.util.SAMLUtil;
 import org.springframework.util.StringUtils;
+import org.w3c.dom.Element;
 
 import javax.xml.namespace.QName;
 import java.security.cert.X509Certificate;
@@ -670,5 +681,289 @@ public class NonSnarlMetadataManager extends MetadataManager implements Extended
         return roleDescriptor;
     }
 
+    @Override
+    public XMLObject getMetadata() throws MetadataProviderException {
+        return new ChainingEntitiesDescriptor();
+    }
 
+    public class ChainingEntitiesDescriptor implements EntitiesDescriptor {
+
+        /** Metadata from the child metadata providers. */
+        private ArrayList<XMLObject> childDescriptors;
+
+        /** Constructor. */
+        public ChainingEntitiesDescriptor() throws MetadataProviderException {
+            childDescriptors = new ArrayList<XMLObject>();
+            for (MetadataProvider provider : getProviders()) {
+                childDescriptors.add(provider.getMetadata());
+            }
+        }
+
+        /** {@inheritDoc} */
+        public List<EntitiesDescriptor> getEntitiesDescriptors() {
+            ArrayList<EntitiesDescriptor> descriptors = new ArrayList<>();
+            for (XMLObject descriptor : childDescriptors) {
+                if (descriptor instanceof EntitiesDescriptor) {
+                    descriptors.add((EntitiesDescriptor) descriptor);
+                }
+            }
+
+            return descriptors;
+        }
+
+        /** {@inheritDoc} */
+        public List<EntityDescriptor> getEntityDescriptors() {
+            ArrayList<EntityDescriptor> descriptors = new ArrayList<>();
+            for (XMLObject descriptor : childDescriptors) {
+                if (descriptor instanceof EntityDescriptor) {
+                    descriptors.add((EntityDescriptor) descriptor);
+                }
+            }
+
+            return descriptors;
+        }
+
+        /** {@inheritDoc} */
+        public Extensions getExtensions() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public String getID() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public String getName() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public void setExtensions(Extensions extensions) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void setID(String newID) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void setName(String name) {
+
+        }
+
+        /** {@inheritDoc} */
+        public String getSignatureReferenceID() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public Signature getSignature() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public boolean isSigned() {
+            return false;
+        }
+
+        /** {@inheritDoc} */
+        public void setSignature(Signature newSignature) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void addNamespace(Namespace namespace) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void detach() {
+
+        }
+
+        /** {@inheritDoc} */
+        public Element getDOM() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public QName getElementQName() {
+            return EntitiesDescriptor.DEFAULT_ELEMENT_NAME;
+        }
+
+        /** {@inheritDoc} */
+        public IDIndex getIDIndex() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public NamespaceManager getNamespaceManager() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public Set<Namespace> getNamespaces() {
+            return new LazySet<>();
+        }
+
+        /** {@inheritDoc} */
+        public String getNoNamespaceSchemaLocation() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public List<XMLObject> getOrderedChildren() {
+            ArrayList<XMLObject> descriptors = new ArrayList<>();
+            try {
+                for (MetadataProvider provider : getProviders()) {
+                    descriptors.add(provider.getMetadata());
+                }
+            } catch (MetadataProviderException e) {
+                log.error("Unable to generate list of child descriptors", e);
+            }
+
+            return descriptors;
+        }
+
+        /** {@inheritDoc} */
+        public XMLObject getParent() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public String getSchemaLocation() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public QName getSchemaType() {
+            return EntitiesDescriptor.TYPE_NAME;
+        }
+
+        /** {@inheritDoc} */
+        public boolean hasChildren() {
+            return !getOrderedChildren().isEmpty();
+        }
+
+        /** {@inheritDoc} */
+        public boolean hasParent() {
+            return false;
+        }
+
+        /** {@inheritDoc} */
+        public void releaseChildrenDOM(boolean propagateRelease) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void releaseDOM() {
+
+        }
+
+        /** {@inheritDoc} */
+        public void releaseParentDOM(boolean propagateRelease) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void removeNamespace(Namespace namespace) {
+
+        }
+
+        /** {@inheritDoc} */
+        public XMLObject resolveID(String id) {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public XMLObject resolveIDFromRoot(String id) {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public void setDOM(Element dom) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void setNoNamespaceSchemaLocation(String location) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void setParent(XMLObject parent) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void setSchemaLocation(String location) {
+
+        }
+
+        /** {@inheritDoc} */
+        public void deregisterValidator(Validator validator) {
+
+        }
+
+        /** {@inheritDoc} */
+        public List<Validator> getValidators() {
+            return new ArrayList<Validator>();
+        }
+
+        /** {@inheritDoc} */
+        public void registerValidator(Validator validator) {
+        }
+
+        /** {@inheritDoc} */
+        public void validate(boolean validateDescendants) throws ValidationException {
+        }
+
+        /** {@inheritDoc} */
+        public DateTime getValidUntil() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public boolean isValid() {
+            return true;
+        }
+
+        /** {@inheritDoc} */
+        public void setValidUntil(DateTime validUntil) {
+
+        }
+
+        /** {@inheritDoc} */
+        public Long getCacheDuration() {
+            return null;
+        }
+
+        /** {@inheritDoc} */
+        public void setCacheDuration(Long duration) {
+
+        }
+
+        /** {@inheritDoc} */
+        public Boolean isNil() {
+            return Boolean.FALSE;
+        }
+
+        /** {@inheritDoc} */
+        public XSBooleanValue isNilXSBoolean() {
+            return new XSBooleanValue(Boolean.FALSE, false);
+        }
+
+        /** {@inheritDoc} */
+        public void setNil(Boolean arg0) {
+            // do nothing
+        }
+
+        /** {@inheritDoc} */
+        public void setNil(XSBooleanValue arg0) {
+            // do nothing
+        }
+
+    }
 }

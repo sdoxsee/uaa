@@ -30,6 +30,7 @@ import org.opensaml.xml.parse.BasicParserPool;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.security.saml.metadata.ExtendedMetadata;
 import org.springframework.security.saml.metadata.ExtendedMetadataDelegate;
+import org.springframework.util.StringUtils;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -111,7 +112,21 @@ public class SamlIdentityProviderConfigurator implements InitializingBean {
         SamlIdentityProviderDefinition clone = providerDefinition.clone();
         added = getExtendedMetadataDelegate(clone);
         String entityIDToBeAdded = ((ConfigMetadataProvider)added.getDelegate()).getEntityID();
+        if (!StringUtils.hasText(entityIDToBeAdded)) {
+            throw new MetadataProviderException("Emtpy entityID for SAML provider with zoneId:"+providerDefinition.getZoneId()+" and origin:"+providerDefinition.getIdpEntityAlias());
+        }
+
         boolean entityIDexists = false;
+
+        for (SamlIdentityProviderDefinition existing : getIdentityProviderDefinitions()) {
+            ConfigMetadataProvider existingProvider = (ConfigMetadataProvider)getExtendedMetadataDelegate(existing).getDelegate();
+            if (entityIDToBeAdded.equals(existingProvider.getEntityID()) &&
+                !(existing.getUniqueAlias().equals(clone.getUniqueAlias()))) {
+                entityIDexists = true;
+                break;
+            }
+        }
+
         if (entityIDexists) {
             throw new MetadataProviderException("Duplicate entity ID:"+entityIDToBeAdded);
         }

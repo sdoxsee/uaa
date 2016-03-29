@@ -30,8 +30,6 @@
  */
 package org.cloudfoundry.identity.uaa.provider.saml;
 
-import org.cloudfoundry.identity.uaa.constants.OriginKeys;
-import org.cloudfoundry.identity.uaa.provider.IdentityProvider;
 import org.cloudfoundry.identity.uaa.provider.IdentityProviderProvisioning;
 import org.cloudfoundry.identity.uaa.provider.SamlIdentityProviderDefinition;
 import org.cloudfoundry.identity.uaa.zone.IdentityZone;
@@ -112,18 +110,15 @@ public class NonSnarlMetadataManager extends MetadataManager implements Extended
     // Storage for cryptographic data used to verify metadata signatures
     protected KeyManager keyManager;
 
-    private final IdentityProviderProvisioning providerDao;
-    private final IdentityZoneProvisioning zoneDao;
     private final SamlIdentityProviderConfigurator configurator;
 
     private Map<IdentityZone, ExtendedMetadataDelegate> localSps = new HashMap<>();
 
     public NonSnarlMetadataManager(IdentityProviderProvisioning providerDao, IdentityZoneProvisioning zoneDao, SamlIdentityProviderConfigurator configurator) throws MetadataProviderException {
         super(Collections.EMPTY_LIST);
-        this.providerDao = providerDao;
-        this.zoneDao = zoneDao;
         this.configurator = configurator;
         this.defaultExtendedMetadata = new ExtendedMetadata();
+        super.setRefreshCheckInterval(0);
     }
 
     @Override
@@ -166,27 +161,21 @@ public class NonSnarlMetadataManager extends MetadataManager implements Extended
 
     public List<ExtendedMetadataDelegate> getAvailableProviders() {
         IdentityZone zone = IdentityZoneHolder.get();
-        List<IdentityProvider> identityProviders = providerDao.retrieveAll(false, zone.getId());
-        List<ExtendedMetadataDelegate> result = new ArrayList<>(identityProviders.size());
+        List<ExtendedMetadataDelegate> result = new ArrayList<>();
         MetadataProvider localSp = localSps.get(IdentityZoneHolder.get());
         if (localSp!=null) {
             result.add((ExtendedMetadataDelegate)localSp);
         }
-        for (IdentityProvider provider : identityProviders) {
-            if (provider.isActive() && OriginKeys.SAML.equals(provider.getType())) {
-                SamlIdentityProviderDefinition definition = (SamlIdentityProviderDefinition)provider.getConfig();
-                log.info("Adding SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]");
-                try {
-                    ExtendedMetadataDelegate delegate = configurator.getExtendedMetadataDelegate(definition);
-                    initializeProvider(delegate);
-                    initializeProviderData(delegate);
-                    initializeProviderFilters(delegate);
-                    result.add(delegate);
-                } catch (MetadataProviderException e) {
-                    log.error("Invalid SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]", e);
-                }
-            } else {
-                log.info("Not an active SAML provider zone[" + zone.getId() + "] origin[" + provider.getOriginKey() + "]");
+        for (SamlIdentityProviderDefinition definition : configurator.getIdentityProviderDefinitions()) {
+            log.info("Adding SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]");
+            try {
+                ExtendedMetadataDelegate delegate = configurator.getExtendedMetadataDelegate(definition);
+                initializeProvider(delegate);
+                initializeProviderData(delegate);
+                initializeProviderFilters(delegate);
+                result.add(delegate);
+            } catch (MetadataProviderException e) {
+                log.error("Invalid SAML IDP zone[" + zone.getId() + "] alias[" + definition.getIdpEntityAlias() + "]", e);
             }
         }
         return result;
@@ -591,7 +580,7 @@ public class NonSnarlMetadataManager extends MetadataManager implements Extended
 
     @Override
     public void setRefreshCheckInterval(long refreshCheckInterval) {
-        //no op
+        super.setRefreshCheckInterval(0);
     }
 
     @Autowired

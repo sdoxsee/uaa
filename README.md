@@ -281,7 +281,7 @@ To run the unit tests using mysql:
 
 
 The database configuration for the common and scim modules is defaulted in 
-the [Spring XML configuration files](https://github.com/cloudfoundry/uaa/blob/master/common/src/main/resources/spring/env.xml). 
+the [Spring XML configuration files](https://github.com/cloudfoundry/uaa/blob/master/server/src/main/resources/spring/env.xml). 
 You can change them by configuring them in `uaa.yml`
 
 The defaults are
